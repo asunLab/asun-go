@@ -126,7 +126,7 @@ type Config struct {
 Typed ASUN output:
 
 ```text
-{name@str,env@[{key@str,value@str}]}:(api,[(RUST_LOG,debug),(PORT,8080)])
+{name@str,env@[{key@str,value@str}]}:(api,[(RUST_LOG,debug),(PORT,"8080")])
 ```
 
 ## Current API
@@ -138,6 +138,8 @@ Typed ASUN output:
 | `EncodePretty` / `EncodePrettyTyped` | Pretty text output |
 | `EncodeBinary`                       | Encode to binary   |
 | `DecodeBinary`                       | Decode from binary |
+| `DecodeBinaryExact`                  | Decode from binary, rejecting trailing bytes |
+| `PrettyFormat`                       | Re-indent compact ASUN text |
 
 ## Run Examples
 

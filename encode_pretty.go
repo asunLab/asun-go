@@ -1,30 +1,27 @@
 package asun
 
 // ---------------------------------------------------------------------------
-// Pretty-print encoder — smart indentation for ASUN output
-// ---------------------------------------------------------------------------
+// Pretty-printed ASUN text — smart indentation over the compact encoders.
 //
 // Simple structures stay inline:
-//   {name, age}:(Alice, 30)
+//
+//	{name@str, age@int}:(Alice, 30)
 //
 // Complex structures expand with 2-space indentation:
-//   {
-//     id,
-//     name,
-//     projects@[{
-//       projectId,
-//       tasks@[{taskId, status}]
-//     }]
-//   }:
-//     (
-//       E001,
-//       John,
-//       [(P001, [(T001, done), (T002, pending)])]
-//     )
+//
+//	{
+//	  id@str,
+//	  name@str,
+//	  addr@{city@str, zip@int}
+//	}:
+//	  (E001, John, (NYC, 10001))
+//
+// The output is byte-for-byte what asun-rs `pretty_format` produces.
+// ---------------------------------------------------------------------------
 
 const prettyMaxWidth = 100
 
-// EncodePretty serializes a struct or slice of structs to pretty-formatted ASUN.
+// EncodePretty serializes v to pretty-formatted ASUN text.
 func EncodePretty(v any) ([]byte, error) {
 	compact, err := Encode(v)
 	if err != nil {
@@ -33,7 +30,8 @@ func EncodePretty(v any) ([]byte, error) {
 	return PrettyFormat(compact), nil
 }
 
-// EncodePrettyTyped serializes with type annotations in pretty format.
+// EncodePrettyTyped serializes v to pretty-formatted ASUN text with scalar
+// type hints.
 func EncodePrettyTyped(v any) ([]byte, error) {
 	compact, err := EncodeTyped(v)
 	if err != nil {
@@ -43,70 +41,95 @@ func EncodePrettyTyped(v any) ([]byte, error) {
 }
 
 // PrettyFormat reformats compact ASUN bytes with smart indentation.
-// Simple structures stay inline; complex ones expand with 2-space indentation.
 func PrettyFormat(src []byte) []byte {
-	n := len(src)
-	if n == 0 {
-		return src
+	if len(src) == 0 {
+		return []byte{}
 	}
-
-	// Build matching bracket table
-	match := buildMatchTable(src)
-	f := &prettyFmt{src: src, match: match, out: make([]byte, 0, n*2)}
+	f := prettyFmt{src: src, mat: buildMatchTable(src), out: make([]byte, 0, len(src)*2)}
 	f.writeTop()
 	return f.out
 }
 
-type prettyFmt struct {
-	src   []byte
-	match []int
-	out   []byte
-	pos   int
-	depth int
+// atomLen is the length of the token at i whose bytes are never structural
+// and are copied verbatim: a quoted string, a `\x` escape inside a plain
+// string, or a comment; 0 when src[i] starts none of them. Unterminated
+// tokens run to the end of the input.
+func atomLen(src []byte, i int) int {
+	n := len(src)
+	switch src[i] {
+	case '"':
+		j := i + 1
+		for j < n {
+			switch src[j] {
+			case '\\':
+				j += 2
+			case '"':
+				return j + 1 - i
+			default:
+				j++
+			}
+		}
+		return n - i
+	case '\\':
+		if n-i < 2 {
+			return n - i
+		}
+		return 2
+	case '/':
+		if i+1 < n && src[i+1] == '*' {
+			j := i + 2
+			for j+1 < n {
+				if src[j] == '*' && src[j+1] == '/' {
+					return j + 2 - i
+				}
+				j++
+			}
+			return n - i
+		}
+	}
+	return 0
 }
 
-func buildMatchTable(src []byte) []int {
+func buildMatchTable(src []byte) []int32 {
 	n := len(src)
-	match := make([]int, n)
-	for i := range match {
-		match[i] = -1
+	mat := make([]int32, n)
+	for i := range mat {
+		mat[i] = -1
 	}
-	var stack []int
-	inQuote := false
-	for i := 0; i < n; i++ {
-		if inQuote {
-			if src[i] == '\\' && i+1 < n {
-				i++
-				continue
-			}
-			if src[i] == '"' {
-				inQuote = false
-			}
+	stack := make([]int, 0, 32)
+	for i := 0; i < n; {
+		if a := atomLen(src, i); a > 0 {
+			i += a
 			continue
 		}
 		switch src[i] {
-		case '"':
-			inQuote = true
 		case '{', '(', '[':
 			stack = append(stack, i)
 		case '}', ')', ']':
 			if len(stack) > 0 {
 				j := stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
-				match[j] = i
-				match[i] = j
+				mat[j] = int32(i)
+				mat[i] = int32(j)
 			}
 		}
+		i++
 	}
-	return match
+	return mat
 }
 
-// writeTop handles the top-level ASUN structure
+type prettyFmt struct {
+	src   []byte
+	mat   []int32
+	out   []byte
+	pos   int
+	depth int
+}
+
 func (f *prettyFmt) writeTop() {
 	if f.pos >= len(f.src) {
 		return
 	}
-
 	if f.src[f.pos] == '[' && f.pos+1 < len(f.src) && f.src[f.pos+1] == '{' {
 		f.writeArrayTop()
 	} else if f.src[f.pos] == '{' {
@@ -116,17 +139,17 @@ func (f *prettyFmt) writeTop() {
 	}
 }
 
-// writeObjectTop formats {schema}:(data)
 func (f *prettyFmt) writeObjectTop() {
 	f.writeGroup()
 	if f.pos < len(f.src) && f.src[f.pos] == ':' {
 		f.out = append(f.out, ':')
 		f.pos++
 		if f.pos < len(f.src) {
-			closePos := f.match[f.pos]
-			if closePos >= 0 && closePos-f.pos+1 <= prettyMaxWidth {
-				f.writeInline(f.pos, closePos+1)
-				f.pos = closePos + 1
+			c := f.mat[f.pos]
+			if c >= 0 && int(c)-f.pos < prettyMaxWidth {
+				end := int(c) + 1
+				f.writeInline(f.pos, end)
+				f.pos = end
 			} else {
 				f.out = append(f.out, '\n')
 				f.depth++
@@ -138,10 +161,9 @@ func (f *prettyFmt) writeObjectTop() {
 	}
 }
 
-// writeArrayTop formats [{schema}]:(t1),(t2),...
 func (f *prettyFmt) writeArrayTop() {
 	f.out = append(f.out, '[')
-	f.pos++ // skip [
+	f.pos++
 	f.writeGroup()
 	if f.pos < len(f.src) && f.src[f.pos] == ']' {
 		f.out = append(f.out, ']')
@@ -151,7 +173,6 @@ func (f *prettyFmt) writeArrayTop() {
 		f.out = append(f.out, ':', '\n')
 		f.pos++
 	}
-
 	f.depth++
 	first := true
 	for f.pos < len(f.src) {
@@ -166,13 +187,18 @@ func (f *prettyFmt) writeArrayTop() {
 		}
 		first = false
 		f.writeIndent()
+		before := f.pos
 		f.writeGroup()
+		if f.pos == before {
+			// A stray closer after the rows: copy it so the loop advances.
+			f.out = append(f.out, f.src[f.pos])
+			f.pos++
+		}
 	}
 	f.out = append(f.out, '\n')
 	f.depth--
 }
 
-// writeGroup formats a bracket group ({...}, (...), [...])
 func (f *prettyFmt) writeGroup() {
 	if f.pos >= len(f.src) {
 		return
@@ -183,57 +209,56 @@ func (f *prettyFmt) writeGroup() {
 		return
 	}
 
-	// Special case: [{...}] array schema — fuse brackets
+	// [{...}] array schema: fuse the brackets.
 	if ch == '[' && f.pos+1 < len(f.src) && f.src[f.pos+1] == '{' {
-		closeBrace := f.match[f.pos+1]
-		closeBracket := f.match[f.pos]
+		closeBrace := f.mat[f.pos+1]
+		closeBracket := f.mat[f.pos]
 		if closeBrace >= 0 && closeBracket >= 0 && closeBrace+1 == closeBracket {
-			width := closeBracket - f.pos + 1
+			width := int(closeBracket) - f.pos + 1
 			if width <= prettyMaxWidth {
-				f.writeInline(f.pos, closeBracket+1)
-				f.pos = closeBracket + 1
+				end := int(closeBracket) + 1
+				f.writeInline(f.pos, end)
+				f.pos = end
 				return
 			}
 			f.out = append(f.out, '[')
 			f.pos++
-			f.writeGroup() // {schema}
+			f.writeGroup()
 			f.out = append(f.out, ']')
-			f.pos++ // skip ]
+			f.pos++
 			return
 		}
 	}
 
-	closePos := f.match[f.pos]
+	closePos := f.mat[f.pos]
 	if closePos < 0 {
 		f.out = append(f.out, ch)
 		f.pos++
 		return
 	}
-
-	width := closePos - f.pos + 1
-	if width <= prettyMaxWidth {
-		f.writeInline(f.pos, closePos+1)
-		f.pos = closePos + 1
+	cl := int(closePos)
+	if cl-f.pos+1 <= prettyMaxWidth {
+		f.writeInline(f.pos, cl+1)
+		f.pos = cl + 1
 		return
 	}
 
-	// Expanded form
-	closeCh := f.src[closePos]
+	// Expanded form.
+	closeCh := f.src[cl]
 	f.out = append(f.out, ch)
 	f.pos++
-
-	if f.pos >= closePos {
+	if f.pos >= cl {
 		f.out = append(f.out, closeCh)
-		f.pos = closePos + 1
+		f.pos = cl + 1
 		return
 	}
-
 	f.out = append(f.out, '\n')
 	f.depth++
-
 	first := true
-	for f.pos < closePos {
-		if f.src[f.pos] == ',' {
+	for f.pos < cl {
+		// The comma is consumed only between slots: a leading `,` ends an
+		// empty (null) first slot and must be kept.
+		if !first && f.src[f.pos] == ',' {
 			f.pos++
 		}
 		if !first {
@@ -241,24 +266,22 @@ func (f *prettyFmt) writeGroup() {
 		}
 		first = false
 		f.writeIndent()
-		f.writeElement(closePos)
+		f.writeElement(cl)
 	}
-
 	f.out = append(f.out, '\n')
 	f.depth--
 	f.writeIndent()
 	f.out = append(f.out, closeCh)
-	f.pos = closePos + 1
+	f.pos = cl + 1
 }
 
-// writeElement writes one comma-delimited element within a bracket group
 func (f *prettyFmt) writeElement(boundary int) {
 	for f.pos < boundary && f.src[f.pos] != ',' {
 		ch := f.src[f.pos]
 		if ch == '{' || ch == '(' || ch == '[' {
 			f.writeGroup()
-		} else if ch == '"' {
-			f.writeQuoted()
+		} else if atomLen(f.src, f.pos) > 0 {
+			f.writeAtom()
 		} else {
 			f.out = append(f.out, ch)
 			f.pos++
@@ -266,15 +289,14 @@ func (f *prettyFmt) writeElement(boundary int) {
 	}
 }
 
-// writeValue writes a non-bracket value
 func (f *prettyFmt) writeValue() {
 	for f.pos < len(f.src) {
 		ch := f.src[f.pos]
 		if ch == ',' || ch == ')' || ch == '}' || ch == ']' {
 			break
 		}
-		if ch == '"' {
-			f.writeQuoted()
+		if atomLen(f.src, f.pos) > 0 {
+			f.writeAtom()
 		} else {
 			f.out = append(f.out, ch)
 			f.pos++
@@ -282,43 +304,25 @@ func (f *prettyFmt) writeValue() {
 	}
 }
 
-// writeQuoted writes a quoted string including quotes
-func (f *prettyFmt) writeQuoted() {
-	f.out = append(f.out, '"')
-	f.pos++
-	for f.pos < len(f.src) {
-		ch := f.src[f.pos]
-		f.out = append(f.out, ch)
-		f.pos++
-		if ch == '\\' && f.pos < len(f.src) {
-			f.out = append(f.out, f.src[f.pos])
-			f.pos++
-		} else if ch == '"' {
-			break
-		}
-	}
+func (f *prettyFmt) writeAtom() {
+	end := f.pos + atomLen(f.src, f.pos)
+	f.out = append(f.out, f.src[f.pos:end]...)
+	f.pos = end
 }
 
-// writeInline writes src[start:end] with spaces after top-level commas
 func (f *prettyFmt) writeInline(start, end int) {
 	depth := 0
-	inQuote := false
-	for i := start; i < end; i++ {
+	for i := start; i < end; {
 		ch := f.src[i]
-		if inQuote {
-			f.out = append(f.out, ch)
-			if ch == '\\' && i+1 < end {
-				i++
-				f.out = append(f.out, f.src[i])
-			} else if ch == '"' {
-				inQuote = false
+		if a := atomLen(f.src, i); a > 0 {
+			if a > end-i {
+				a = end - i
 			}
+			f.out = append(f.out, f.src[i:i+a]...)
+			i += a
 			continue
 		}
 		switch ch {
-		case '"':
-			inQuote = true
-			f.out = append(f.out, ch)
 		case '{', '(', '[':
 			depth++
 			f.out = append(f.out, ch)
@@ -333,10 +337,10 @@ func (f *prettyFmt) writeInline(start, end int) {
 		default:
 			f.out = append(f.out, ch)
 		}
+		i++
 	}
 }
 
-// writeIndent writes 2-space indentation for the current depth
 func (f *prettyFmt) writeIndent() {
 	for i := 0; i < f.depth; i++ {
 		f.out = append(f.out, ' ', ' ')

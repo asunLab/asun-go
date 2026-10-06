@@ -1,304 +1,883 @@
 package asun
 
 import (
+	"bytes"
 	"math"
 	"reflect"
 	"strconv"
 	"sync"
-	"unsafe"
 )
 
 // ---------------------------------------------------------------------------
-// Lookup tables
+// Encode — Go values to ASUN text
+//
+// The output is byte-for-byte what asun-rs produces for the equivalent Rust
+// value: a struct is `{schema}:(...)`, a slice of structs `[{schema}]:(...)`,
+// anything else a plain value. Schema bindings come from the encoded values
+// (the first row of a slice of structs), exactly as in asun-rs: nested
+// structs get `@{...}`, slices `@[...]`, and EncodeTyped adds scalar hints.
 // ---------------------------------------------------------------------------
 
-// needsQuote[b] is true if byte b forces a string to be wrapped in "..."
-var needsQuote = func() [256]bool {
-	var t [256]bool
-	for i := 0; i < 33; i++ { // 0x00..=0x1f plus 0x20 (space)
-		t[i] = true
-	}
-	t[','] = true
-	t['@'] = true
-	t['('] = true
-	t[')'] = true
-	t['['] = true
-	t[']'] = true
-	t['{'] = true
-	t['}'] = true
-	t[':'] = true
-	t['<'] = true
-	t['>'] = true
-	t['/'] = true
-	t['*'] = true
-	t['"'] = true
-	t['\\'] = true
-	t[0x7f] = true
-	return t
-}()
-
-// escapeChar[b] is the char after '\' for byte b inside a quoted string.
-// 0 means the byte needs no escaping.
-var escapeChar = func() [256]byte {
-	var t [256]byte
-	t['"'] = '"'
-	t['\\'] = '\\'
-	t['\n'] = 'n'
-	t['\r'] = 'r'
-	t['\t'] = 't'
-	t[0x08] = 'b'
-	t[0x0c] = 'f'
-	return t
-}()
-
-// decDigits is a two-digit lookup for fast integer formatting.
-const decDigits = "00010203040506070809" +
-	"10111213141516171819" +
-	"20212223242526272829" +
-	"30313233343536373839" +
-	"40414243444546474849" +
-	"50515253545556575859" +
-	"60616263646566676869" +
-	"70717273747576777879" +
-	"80818283848586878889" +
-	"90919293949596979899"
-
-// ---------------------------------------------------------------------------
-// Buffer pool
-// ---------------------------------------------------------------------------
-
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 256)
-		return &b
-	},
+// Encode serializes v to ASUN text with a plain schema.
+func Encode(v any) ([]byte, error) {
+	return encodeInner(v, false)
 }
 
-var noMapTypeCache sync.Map // map[reflect.Type]bool
-
-var errMapFieldsUnsupported = &MarshalError{
-	Message: "map fields are not supported",
+// EncodeTyped serializes v to ASUN text with scalar type hints in the schema.
+func EncodeTyped(v any) ([]byte, error) {
+	return encodeInner(v, true)
 }
 
-func getBuf() *[]byte {
-	bp := bufPool.Get().(*[]byte)
-	*bp = (*bp)[:0]
-	return bp
-}
+var encPool = sync.Pool{New: func() any { return &encoder{} }}
 
-func putBuf(bp *[]byte) {
-	if cap(*bp) <= 1<<16 {
-		bufPool.Put(bp)
+func encodeInner(v any, typed bool) ([]byte, error) {
+	rv := reflect.ValueOf(v)
+	if out, ok, err := encodeStaticTop(rv, typed); ok {
+		return out, err
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Fast number formatting
-// ---------------------------------------------------------------------------
-
-func appendU64(buf []byte, v uint64) []byte {
-	if v < 10 {
-		return append(buf, byte('0'+v))
-	}
-	if v < 100 {
-		idx := v * 2
-		return append(buf, decDigits[idx], decDigits[idx+1])
-	}
-	var tmp [20]byte
-	i := 20
-	for v >= 100 {
-		rem := v % 100
-		v /= 100
-		i -= 2
-		tmp[i] = decDigits[rem*2]
-		tmp[i+1] = decDigits[rem*2+1]
-	}
-	if v >= 10 {
-		idx := v * 2
-		i -= 2
-		tmp[i] = decDigits[idx]
-		tmp[i+1] = decDigits[idx+1]
-	} else {
-		i--
-		tmp[i] = byte('0' + v)
-	}
-	return append(buf, tmp[i:]...)
-}
-
-func appendI64(buf []byte, v int64) []byte {
-	if v < 0 {
-		buf = append(buf, '-')
-		if v == math.MinInt64 {
-			return append(buf, "9223372036854775808"...)
-		}
-		return appendU64(buf, uint64(-v))
-	}
-	return appendU64(buf, uint64(v))
-}
-
-func appendFloat64(buf []byte, v float64) []byte {
-	if math.IsInf(v, 0) || math.IsNaN(v) {
-		return append(buf, '0')
-	}
-	// Integer-valued float: write as int + ".0". Guard against -0.0, whose
-	// sign bit must be preserved — the integer path would drop it.
-	if v != 0 {
-		_, frac := math.Modf(v)
-		if frac == 0.0 {
-			iv := int64(v)
-			if float64(iv) == v {
-				buf = appendI64(buf, iv)
-				return append(buf, '.', '0')
-			}
+	if rv.IsValid() {
+		if err := ensureNoMapType(rv.Type()); err != nil {
+			return nil, err
 		}
 	}
-	// Non-integer (and signed zero): defer to shortest round-trip formatting.
-	// The hand-rolled 1/2-decimal fast paths were removed — they broke the
-	// shortest round-trip property (e.g. 2.675 → 2.68) and dropped -0.0's sign.
-	// strconv's Ryū-based formatter is both correct and fast.
-	return appendFloatGeneral(buf, v)
+	e := encPool.Get().(*encoder)
+	e.reset(typed)
+	err := e.encodeValue(rv)
+	var out []byte
+	if err == nil {
+		if len(e.buf) == 0 {
+			// A top-level null writes nothing into its (absent) slot, and an
+			// empty document is invalid.
+			e.buf = append(e.buf, "null"...)
+		}
+		out = append([]byte(nil), e.buf...)
+	}
+	if cap(e.buf) <= 1<<16 {
+		encPool.Put(e)
+	}
+	return out, err
 }
 
-func appendFloatGeneral(buf []byte, v float64) []byte {
-	// Use strconv for full correctness on edge cases
-	buf = strconv.AppendFloat(buf, v, 'f', -1, 64)
-	// Ensure decimal point for float identity
-	hasDecimal := false
-	for i := len(buf) - 1; i >= 0; i-- {
-		if buf[i] == '.' {
-			hasDecimal = true
-			break
-		}
-		if buf[i] == '-' || buf[i] < '0' || buf[i] > '9' {
-			break
-		}
-	}
-	if !hasDecimal {
-		buf = append(buf, '.', '0')
-	}
-	return buf
-}
-
-// ---------------------------------------------------------------------------
-// Untyped value encoding (scalar / slice / map / interface)
-// ---------------------------------------------------------------------------
-
-// appendUntyped writes v in untyped ASUN form: scalars bare, plain arrays
-// as [a,b,c], maps are rejected, null becomes `()` (the untyped null marker).
-func appendUntyped(buf []byte, rv reflect.Value) ([]byte, error) {
-	if !rv.IsValid() {
-		return append(buf, '(', ')'), nil
-	}
-	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Ptr {
-		if rv.IsNil() {
-			return append(buf, '(', ')'), nil
-		}
+// encodeStaticTop encodes a static struct (or a non-nil pointer to one)
+// directly; ok is false for any other value. Static structs hold no maps.
+func encodeStaticTop(rv reflect.Value, typed bool) (_ []byte, ok bool, _ error) {
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() {
 		rv = rv.Elem()
 	}
-	switch rv.Kind() {
-	case reflect.Bool:
-		if rv.Bool() {
-			return append(buf, "true"...), nil
-		}
-		return append(buf, "false"...), nil
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return appendI64(buf, rv.Int()), nil
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return appendU64(buf, rv.Uint()), nil
-	case reflect.Float32, reflect.Float64:
-		return appendFloat64(buf, rv.Float()), nil
-	case reflect.String:
-		return appendStr(buf, rv.String()), nil
-	case reflect.Slice, reflect.Array:
-		buf = append(buf, '[')
-		n := rv.Len()
-		for i := 0; i < n; i++ {
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			var err error
-			buf, err = appendUntyped(buf, rv.Index(i))
-			if err != nil {
-				return buf, err
-			}
-		}
-		buf = append(buf, ']')
-		return buf, nil
-	case reflect.Map:
-		return buf, &MarshalError{"map encoding is not supported"}
-	case reflect.Struct:
-		// Should be handled by the typed path; fall through as an error here.
-		return buf, &MarshalError{"struct in untyped path is unexpected"}
+	if rv.Kind() != reflect.Struct {
+		return nil, false, nil
 	}
-	return buf, &MarshalError{"unsupported untyped value kind: " + rv.Kind().String()}
+	si := getStructInfo(rv.Type())
+	if !si.static {
+		return nil, false, nil
+	}
+	hdr := staticHeader(si, typed)
+	if hdr == nil {
+		return nil, false, nil
+	}
+	e := encPool.Get().(*encoder)
+	buf := append(e.buf[:0], hdr...)
+	buf = append(buf, ':', '(')
+	buf, err := appendStaticFields(buf, rv, si)
+	var out []byte
+	if err == nil {
+		buf = append(buf, ')')
+		out = append([]byte(nil), buf...)
+	}
+	e.buf = buf
+	if cap(buf) <= 1<<16 {
+		encPool.Put(e)
+	}
+	return out, true, err
+}
+
+// encoder mirrors asun-rs `Encoder`, including its schema capture state.
+type encoder struct {
+	buf     []byte
+	inTuple bool
+	first   bool
+	typed   bool
+	// Type hint recorded for the field being encoded ("" = none).
+	hint string
+	// Top-level slice of structs.
+	inTopSeq        bool
+	topSeqDataStart int
+	topSeqCaptured  bool
+	topSeqFields    []string
+	topSeqTypes     []string
+	topSeqSchemas   [][]byte
+	// Schema fragment bubbled up from a nested struct / slice (nil = none).
+	nestedSchema []byte
+	// Rows 2+ of a homogeneous slice of structs reuse row 1's schema.
+	skipCapture bool
+	// The top-level sequence is encoding one of its direct elements.
+	topSeqDirect bool
+	// Cached header of a static row type (nil = use the capture).
+	topSeqStatic []byte
+	// Set while computing a static header, which must use the capture.
+	noStatic bool
+	// Header of the last top-level struct, without the `:`.
+	topHeader []byte
+	// One-entry struct metadata cache: rows repeat one type.
+	siType reflect.Type
+	si     *structInfo
+}
+
+func (e *encoder) reset(typed bool) {
+	*e = encoder{buf: e.buf[:0], first: true, typed: typed, siType: e.siType, si: e.si}
+}
+
+func (e *encoder) structInfo(t reflect.Type) *structInfo {
+	if t != e.siType {
+		e.si = getStructInfo(t)
+		e.siType = t
+	}
+	return e.si
+}
+
+// staticHeader returns the cached `{schema}` of a static struct type: the
+// capture of its zero value, which is the capture of every value.
+func staticHeader(si *structInfo, typed bool) []byte {
+	i := 0
+	if typed {
+		i = 1
+	}
+	if h := si.headers[i].Load(); h != nil {
+		return *h
+	}
+	c := &encoder{first: true, typed: typed, noStatic: true}
+	if err := c.encodeStruct(reflect.New(si.structType).Elem()); err != nil {
+		return nil
+	}
+	h := bytes.Clone(c.topHeader)
+	h = h[:len(h):len(h)]
+	si.headers[i].Store(&h)
+	return h
+}
+
+func (e *encoder) pushSeparator() {
+	if !e.first {
+		e.buf = append(e.buf, ',')
+	}
+	e.first = false
+}
+
+func (e *encoder) setHint(h string) {
+	if e.typed && e.hint == "" {
+		e.hint = h
+	}
+}
+
+func (e *encoder) encodeValue(rv reflect.Value) error {
+	switch rv.Kind() {
+	case reflect.Invalid:
+		e.pushSeparator()
+	case reflect.Bool:
+		e.pushSeparator()
+		e.setHint("bool")
+		if rv.Bool() {
+			e.buf = append(e.buf, "true"...)
+		} else {
+			e.buf = append(e.buf, "false"...)
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		e.pushSeparator()
+		e.setHint("int")
+		e.buf = strconv.AppendInt(e.buf, rv.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		e.pushSeparator()
+		e.setHint("int")
+		e.buf = strconv.AppendUint(e.buf, rv.Uint(), 10)
+	case reflect.Float32, reflect.Float64:
+		v := rv.Float()
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			return errNonFinite
+		}
+		e.pushSeparator()
+		e.setHint("float")
+		e.buf = appendFloat64(e.buf, v)
+	case reflect.String:
+		e.pushSeparator()
+		e.setHint("str")
+		e.buf = appendStr(e.buf, rv.String())
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			e.pushSeparator()
+			return nil
+		}
+		return e.encodeValue(rv.Elem())
+	case reflect.Slice, reflect.Array:
+		return e.encodeSeq(rv)
+	case reflect.Struct:
+		return e.encodeStruct(rv)
+	case reflect.Map:
+		return errMapFieldsUnsupported
+	default:
+		return &MarshalError{Message: "unsupported type " + rv.Type().String()}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
-// String quoting / escaping
+// Sequences (asun-rs `begin_seq` / `SeqEncoder`)
 // ---------------------------------------------------------------------------
 
-func stringNeedsQuoting(s string) bool {
-	if len(s) == 0 {
-		return true
-	}
-	b := unsafe.Slice(unsafe.StringData(s), len(s))
-	first := b[0]
-	last := b[len(b)-1]
-	if first == ' ' || first == '\t' || first == '\n' || first == '\r' ||
-		last == ' ' || last == '\t' || last == '\n' || last == '\r' {
-		return true
-	}
-	if s == "true" || s == "false" || s == "True" || s == "False" || s == "TRUE" || s == "FALSE" {
-		return true
-	}
-	for i := 0; i < len(b); i++ {
-		if needsQuote[b[i]] {
-			return true
+func (e *encoder) encodeSeq(rv reflect.Value) error {
+	n := rv.Len()
+	if n > 0 && !e.noStatic {
+		if et := rv.Type().Elem(); et.Kind() == reflect.Struct {
+			if si := e.structInfo(et); si.static {
+				if hdr := staticHeader(si, e.typed); hdr != nil {
+					return e.encodeStaticSeq(rv, n, si, hdr)
+				}
+			}
 		}
 	}
-	// Number-like prefix forces quoting.
-	c0 := b[0]
-	if c0 >= '0' && c0 <= '9' {
+	if n > 0 && e.skipCapture && e.inTuple && isScalarKind(rv.Type().Elem().Kind()) {
+		return e.encodeScalarSeq(rv, n)
+	}
+	isTop := !e.inTuple
+	if isTop {
+		// Both top-level forms start with `[`: `[{schema}]:rows` and `[v,...]`.
+		e.inTopSeq = true
+		e.inTuple = true
+		e.buf = append(e.buf, '[')
+		e.topSeqDataStart = len(e.buf)
+		e.topSeqCaptured = false
+		e.topSeqFields = nil
+		e.topSeqTypes = nil
+		e.topSeqStatic = nil
+	} else {
+		e.topSeqDirect = false
+		e.pushSeparator()
+		e.buf = append(e.buf, '[')
+	}
+	dataStart := len(e.buf)
+	first := true
+	skipWasSet := false
+	headerDone := false
+	hasNull := false
+	var cachedNested []byte
+
+	for i := 0; i < n; i++ {
+		if !first {
+			e.buf = append(e.buf, ',')
+		}
+		wasFirst := first
+		first = false
+		e.first = true
+		var err error
+		if isTop {
+			before := len(e.buf)
+			e.topSeqDirect = true
+			err = e.encodeValue(rv.Index(i))
+			e.topSeqDirect = false
+			hasNull = hasNull || len(e.buf) == before
+		} else {
+			err = e.encodeValue(rv.Index(i))
+		}
+		if isTop && !headerDone && e.topSeqCaptured {
+			e.skipCapture = true
+			skipWasSet = true
+			// The header is known after the first struct row: insert it in
+			// front of that row.
+			headerDone = true
+			header := e.topSeqHeader()
+			e.buf = append(e.buf, header...)
+			copy(e.buf[e.topSeqDataStart+len(header):], e.buf[e.topSeqDataStart:len(e.buf)-len(header)])
+			copy(e.buf[e.topSeqDataStart:], header)
+		}
+		if wasFirst && !isTop && e.nestedSchema != nil {
+			cachedNested = append([]byte(nil), e.nestedSchema...)
+			e.skipCapture = true
+			skipWasSet = true
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	if skipWasSet {
+		e.skipCapture = false
+	}
+	if cachedNested != nil {
+		e.nestedSchema = cachedNested
+	}
+	// `[]` is the empty array; a single null element must be explicit.
+	loneNull := !first && len(e.buf) == dataStart
+	if isTop {
+		if e.topSeqCaptured && hasNull {
+			return &MarshalError{Message: "cannot encode a null row in a [{schema}]: sequence"}
+		}
+		if loneNull {
+			e.buf = append(e.buf, "null"...)
+		}
+		if !headerDone {
+			e.buf = append(e.buf, ']')
+		}
+		e.inTopSeq = false
+	} else {
+		if loneNull {
+			e.buf = append(e.buf, "null"...)
+		}
+		e.buf = append(e.buf, ']')
+		switch {
+		case e.skipCapture:
+			e.nestedSchema = nil
+			if e.typed {
+				e.hint = ""
+			}
+		case e.nestedSchema != nil:
+			w := make([]byte, 0, len(e.nestedSchema)+2)
+			w = append(w, '[')
+			w = append(w, e.nestedSchema...)
+			e.nestedSchema = append(w, ']')
+		case e.hint != "":
+			e.nestedSchema = []byte("[" + e.hint + "]")
+			e.hint = ""
+		default:
+			e.nestedSchema = []byte("[]")
+		}
+	}
+	e.first = false
+	return nil
+}
+
+// encodeStaticSeq encodes a non-empty sequence of static structs: the same
+// bytes as the generic path, without per-row schema bookkeeping.
+func (e *encoder) encodeStaticSeq(rv reflect.Value, n int, si *structInfo, hdr []byte) error {
+	isTop := !e.inTuple
+	if isTop {
+		e.inTuple = true
+		e.buf = append(e.buf, '[')
+		e.buf = append(e.buf, hdr...)
+		e.buf = append(e.buf, ']', ':')
+	} else {
+		e.topSeqDirect = false
+		e.pushSeparator()
+		e.buf = append(e.buf, '[')
+	}
+	buf := e.buf
+	var err error
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, '(')
+		if buf, err = appendStaticFields(buf, rv.Index(i), si); err != nil {
+			e.buf = buf
+			return err
+		}
+		buf = append(buf, ')')
+	}
+	e.buf = buf
+	if !isTop {
+		e.buf = append(e.buf, ']')
+		if e.skipCapture {
+			e.nestedSchema = nil
+			if e.typed {
+				e.hint = ""
+			}
+		} else {
+			w := make([]byte, 0, len(hdr)+2)
+			w = append(w, '[')
+			w = append(w, hdr...)
+			e.nestedSchema = append(w, ']')
+		}
+	}
+	e.first = false
+	return nil
+}
+
+func isScalarKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.String:
 		return true
-	}
-	if (c0 == '-' || c0 == '+') && len(b) >= 2 {
-		c1 := b[1]
-		if c1 >= '0' && c1 <= '9' {
-			return true
-		}
-	}
-	if c0 == '.' && len(b) >= 2 {
-		c1 := b[1]
-		if c1 >= '0' && c1 <= '9' {
-			return true
-		}
 	}
 	return false
 }
 
-func appendEscaped(buf []byte, s string) []byte {
-	buf = append(buf, '"')
-	b := unsafe.Slice(unsafe.StringData(s), len(s))
-	const hex = "0123456789abcdef"
-	start := 0
-	for i := 0; i < len(b); i++ {
-		c := b[i]
-		esc := escapeChar[c]
-		if esc != 0 {
-			buf = append(buf, b[start:i]...)
-			buf = append(buf, '\\', esc)
-			start = i + 1
-			continue
+// encodeScalarSeq encodes a non-empty nested sequence of scalars whose
+// schema is not being captured (rows after the first).
+func (e *encoder) encodeScalarSeq(rv reflect.Value, n int) error {
+	e.topSeqDirect = false
+	e.pushSeparator()
+	buf := append(e.buf, '[')
+	var err error
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			buf = append(buf, ',')
 		}
-		if c < 0x20 || c == 0x7f {
-			buf = append(buf, b[start:i]...)
-			buf = append(buf, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
-			start = i + 1
+		if buf, _, err = appendScalar(buf, rv.Index(i)); err != nil {
+			e.buf = buf
+			return err
 		}
 	}
-	buf = append(buf, b[start:]...)
-	buf = append(buf, '"')
+	e.buf = append(buf, ']')
+	e.nestedSchema = nil
+	if e.typed {
+		e.hint = ""
+	}
+	e.first = false
+	return nil
+}
+
+// topSeqHeader writes `{name@binding,...}]:` from the first row's capture.
+func (e *encoder) topSeqHeader() []byte {
+	if e.topSeqStatic != nil {
+		out := make([]byte, 0, len(e.topSeqStatic)+3)
+		out = append(out, e.topSeqStatic...)
+		return append(out, "]:"...)
+	}
+	out := make([]byte, 0, 64)
+	out = append(out, '{')
+	for i, f := range e.topSeqFields {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = appendSchemaFieldName(out, f)
+		if i < len(e.topSeqSchemas) && e.topSeqSchemas[i] != nil {
+			out = append(out, '@')
+			out = append(out, e.topSeqSchemas[i]...)
+		} else if e.typed && i < len(e.topSeqTypes) && e.topSeqTypes[i] != "" {
+			out = append(out, '@')
+			out = append(out, e.topSeqTypes[i]...)
+		}
+	}
+	return append(out, "}]:"...)
+}
+
+// ---------------------------------------------------------------------------
+// Structs (asun-rs `begin_struct` / `StructEncoder`)
+// ---------------------------------------------------------------------------
+
+type capture struct {
+	fields  []string
+	types   []string
+	schemas [][]byte
+}
+
+func (c *capture) writeSchema(out []byte, typed bool) []byte {
+	out = append(out, '{')
+	for i, f := range c.fields {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = appendSchemaFieldName(out, f)
+		if c.schemas[i] != nil {
+			out = append(out, '@')
+			out = append(out, c.schemas[i]...)
+		} else if typed && c.types[i] != "" {
+			out = append(out, '@')
+			out = append(out, c.types[i]...)
+		}
+	}
+	return append(out, '}')
+}
+
+func (e *encoder) encodeStruct(rv reflect.Value) error {
+	si := e.structInfo(rv.Type())
+	isTop := !e.inTuple
+	captureForSeq := !isTop && e.inTopSeq && e.topSeqDirect && !e.topSeqCaptured
+	e.topSeqDirect = false
+	if si.static && !e.noStatic && (isTop || !e.skipCapture) {
+		if hdr := staticHeader(si, e.typed); hdr != nil {
+			return e.encodeStaticStruct(rv, si, hdr, isTop, captureForSeq)
+		}
+	}
+	var cap *capture
+	if isTop || !e.skipCapture {
+		n := len(si.fields)
+		cap = &capture{fields: make([]string, 0, n), schemas: make([][]byte, 0, n)}
+		if e.typed {
+			cap.types = make([]string, 0, n)
+		}
+	}
+	if isTop {
+		e.buf = append(e.buf, '(')
+		e.inTuple = true
+	} else {
+		e.pushSeparator()
+		e.buf = append(e.buf, '(')
+	}
+
+	for i := range si.fields {
+		if cap != nil {
+			cap.fields = append(cap.fields, si.fields[i].name)
+			e.hint = ""
+			e.nestedSchema = nil
+		}
+		if i > 0 {
+			e.buf = append(e.buf, ',')
+		}
+		fv := si.field(rv, i)
+		if cap == nil {
+			// No capture: a scalar needs none of the encoder state.
+			buf, ok, err := appendScalar(e.buf, fv)
+			e.buf = buf
+			if err != nil {
+				return err
+			}
+			if ok {
+				continue
+			}
+		}
+		e.first = true
+		e.inTuple = true
+		if err := e.encodeValue(fv); err != nil {
+			return err
+		}
+		if cap != nil {
+			cap.schemas = append(cap.schemas, e.nestedSchema)
+			e.nestedSchema = nil
+			if e.typed {
+				cap.types = append(cap.types, e.hint)
+				e.hint = ""
+			}
+		} else {
+			e.nestedSchema = nil
+			e.hint = ""
+		}
+	}
+
+	e.buf = append(e.buf, ')')
+	if cap == nil {
+		e.first = false
+		e.hint = ""
+		return nil
+	}
+	if isTop {
+		header := cap.writeSchema(make([]byte, 0, len(cap.fields)*16+4), e.typed)
+		e.topHeader = header
+		header = append(header, ':')
+		h := len(header)
+		e.buf = append(e.buf, header...)
+		copy(e.buf[h:], e.buf[:len(e.buf)-h])
+		copy(e.buf, header)
+		return nil
+	}
+	e.first = false
+	if captureForSeq {
+		e.topSeqCaptured = true
+		e.topSeqFields = cap.fields
+		e.topSeqSchemas = cap.schemas
+		if e.typed {
+			e.topSeqTypes = cap.types
+		}
+	} else {
+		e.nestedSchema = cap.writeSchema(make([]byte, 0, 64), e.typed)
+	}
+	e.hint = ""
+	return nil
+}
+
+// encodeStaticStruct encodes a struct whose schema is the cached hdr. It
+// produces exactly what the capture path does, without capturing.
+func (e *encoder) encodeStaticStruct(rv reflect.Value, si *structInfo, hdr []byte, isTop, captureForSeq bool) error {
+	if isTop {
+		e.buf = append(e.buf, hdr...)
+		e.buf = append(e.buf, ':', '(')
+		e.inTuple = true
+	} else {
+		e.pushSeparator()
+		e.buf = append(e.buf, '(')
+	}
+	var err error
+	if e.buf, err = appendStaticFields(e.buf, rv, si); err != nil {
+		return err
+	}
+	e.buf = append(e.buf, ')')
+	e.hint = ""
+	if isTop {
+		e.topHeader = hdr
+		return nil
+	}
+	e.first = false
+	if captureForSeq {
+		e.topSeqCaptured = true
+		e.topSeqStatic = hdr
+	} else if !e.skipCapture {
+		e.nestedSchema = hdr
+	}
+	return nil
+}
+
+// appendStaticFields writes the slots of a static struct: scalars and nested
+// static structs need none of the encoder's schema state.
+func appendStaticFields(buf []byte, rv reflect.Value, si *structInfo) ([]byte, error) {
+	for i := range si.fields {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		fv := si.field(rv, i)
+		var ok bool
+		var err error
+		if buf, ok, err = appendScalar(buf, fv); err != nil {
+			return buf, err
+		}
+		if !ok { // static struct
+			buf = append(buf, '(')
+			if buf, err = appendStaticFields(buf, fv, getStructInfo(fv.Type())); err != nil {
+				return buf, err
+			}
+			buf = append(buf, ')')
+		}
+	}
+	return buf, nil
+}
+
+// appendScalar writes a bool, integer, float or string value; ok is false
+// for any other kind, which is left to the caller.
+func appendScalar(buf []byte, fv reflect.Value) (_ []byte, ok bool, _ error) {
+	switch fv.Kind() {
+	case reflect.Bool:
+		if fv.Bool() {
+			return append(buf, "true"...), true, nil
+		}
+		return append(buf, "false"...), true, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.AppendInt(buf, fv.Int(), 10), true, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.AppendUint(buf, fv.Uint(), 10), true, nil
+	case reflect.Float32, reflect.Float64:
+		v := fv.Float()
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			return buf, true, errNonFinite
+		}
+		return appendFloat64(buf, v), true, nil
+	case reflect.String:
+		return appendStr(buf, fv.String()), true, nil
+	}
+	return buf, false, nil
+}
+
+// ---------------------------------------------------------------------------
+// Scalars
+// ---------------------------------------------------------------------------
+
+var errNonFinite = &MarshalError{Message: "cannot serialize non-finite float (NaN/Infinity)"}
+
+// exactIntLimit is 2^53: above it consecutive integers are not all
+// representable, so a plain decimal is not necessarily the shortest form.
+const exactIntLimit = 9007199254740992.0
+
+// appendFloat64 formats v like asun-rs: integers as `N.0`, one- and
+// two-decimal values directly, everything else in the shortest round-trip
+// form laid out as the Rust `ryu` crate does.
+func appendFloat64(buf []byte, v float64) []byte {
+	if math.Abs(v) < exactIntLimit {
+		if v == math.Trunc(v) {
+			if v == 0 && math.Signbit(v) {
+				return append(buf, "-0.0"...)
+			}
+			buf = strconv.AppendInt(buf, int64(v), 10)
+			return append(buf, '.', '0')
+		}
+		s10 := v * 10
+		if s10 == math.Trunc(s10) && math.Abs(s10) < exactIntLimit {
+			k := int64(s10)
+			if float64(k)/10 == v {
+				return appendScaled(buf, k, 10)
+			}
+		}
+		s100 := v * 100
+		if s100 == math.Trunc(s100) && math.Abs(s100) < exactIntLimit {
+			k := int64(s100)
+			if float64(k)/100 == v {
+				return appendScaled(buf, k, 100)
+			}
+		}
+	}
+	return appendRyu(buf, v)
+}
+
+// appendScaled writes k/scale (scale 10 or 100), dropping a trailing zero of
+// the second decimal.
+func appendScaled(buf []byte, k int64, scale uint64) []byte {
+	mag := uint64(k)
+	if k < 0 {
+		buf = append(buf, '-')
+		mag = uint64(-k)
+	}
+	buf = strconv.AppendUint(buf, mag/scale, 10)
+	buf = append(buf, '.')
+	f := mag % scale
+	if scale == 10 {
+		return append(buf, byte('0'+f))
+	}
+	buf = append(buf, byte('0'+f/10))
+	if f%10 != 0 {
+		buf = append(buf, byte('0'+f%10))
+	}
 	return buf
+}
+
+// appendRyu writes the shortest round-trip digits of v in the layout of the
+// Rust `ryu` crate: plain decimals for 1e-5 <= |v| < 1e16, otherwise
+// `d.ddde±x` without a `+`.
+func appendRyu(buf []byte, v float64) []byte {
+	var tmp [32]byte
+	s := strconv.AppendFloat(tmp[:0], v, 'e', -1, 64)
+	if s[0] == '-' {
+		buf = append(buf, '-')
+		s = s[1:]
+	}
+	// s is "d[.ddd]e±xx".
+	ePos := 0
+	for s[ePos] != 'e' {
+		ePos++
+	}
+	var digits [24]byte
+	nd := 0
+	for _, c := range s[:ePos] {
+		if c != '.' {
+			digits[nd] = c
+			nd++
+		}
+	}
+	exp, _ := strconv.Atoi(string(s[ePos+1:]))
+	length := nd
+	kk := exp + 1 // 10^(kk-1) <= v < 10^kk
+	k := kk - length
+	switch {
+	case 0 <= k && kk <= 16:
+		buf = append(buf, digits[:nd]...)
+		for i := length; i < kk; i++ {
+			buf = append(buf, '0')
+		}
+		return append(buf, '.', '0')
+	case 0 < kk && kk <= 16:
+		buf = append(buf, digits[:kk]...)
+		buf = append(buf, '.')
+		return append(buf, digits[kk:nd]...)
+	case -5 < kk && kk <= 0:
+		buf = append(buf, '0', '.')
+		for i := 0; i < -kk; i++ {
+			buf = append(buf, '0')
+		}
+		return append(buf, digits[:nd]...)
+	case length == 1:
+		buf = append(buf, digits[0], 'e')
+		return strconv.AppendInt(buf, int64(kk-1), 10)
+	default:
+		buf = append(buf, digits[0], '.')
+		buf = append(buf, digits[1:nd]...)
+		buf = append(buf, 'e')
+		return strconv.AppendInt(buf, int64(kk-1), 10)
+	}
+}
+
+// needsQuote marks bytes that may force a string value to be quoted.
+var needsQuote = func() [256]bool {
+	var t [256]bool
+	for i := 0; i < 0x20; i++ {
+		t[i] = true
+	}
+	for _, c := range []byte(`,()[]{}/"\`) {
+		t[c] = true
+	}
+	t[0x7f] = true
+	return t
+}()
+
+// stringNeedsQuoting reports whether s must be quoted (asun-rs `quote_scan`).
+//
+// A plain string may contain anything except `, ( ) [ ] { } " \`, control
+// characters and the sequence `/*`; it must not start or end with
+// whitespace, and it must not read back as another type (`true`, `false`,
+// `null`, a number). Interior spaces, `@`, `:`, `/` and `*` stay bare.
+func stringNeedsQuoting(s string) bool {
+	n := len(s)
+	if n == 0 {
+		return true
+	}
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if !needsQuote[c] {
+			continue
+		}
+		if c == '/' {
+			if i+1 < n && s[i+1] == '*' {
+				return true
+			}
+			continue
+		}
+		return true
+	}
+	if s[n-1] == ' ' {
+		return true
+	}
+	switch first := s[0]; {
+	case first == '-' || first == '+' || first == '.' || (first >= '0' && first <= '9'):
+	case first == ' ':
+		return true
+	case first == 't' || first == 'f' || first == 'n':
+		return s == "true" || s == "false" || s == "null"
+	case first == 0xEF:
+		return len(s) >= 3 && s[1] == 0xBB && s[2] == 0xBF
+	default:
+		return false
+	}
+	// Anything the decoder might re-read as a number.
+	i := 0
+	if s[0] == '-' || s[0] == '+' {
+		i = 1
+	}
+	sawDigit, sawDot, sawExp := false, false, false
+	for ; i < n; i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			sawDigit = true
+		case c == '.' && !sawDot && !sawExp:
+			sawDot = true
+		case (c == 'e' || c == 'E') && sawDigit && !sawExp:
+			sawExp = true
+			if i+1 < n && (s[i+1] == '+' || s[i+1] == '-') {
+				i++
+			}
+			sawDigit = false
+		default:
+			return false
+		}
+	}
+	return sawDigit
+}
+
+func appendEscaped(buf []byte, s string) []byte {
+	const hex = "0123456789abcdef"
+	buf = append(buf, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' && c != 0x7f {
+			continue
+		}
+		buf = append(buf, s[start:i]...)
+		switch c {
+		case '"':
+			buf = append(buf, '\\', '"')
+		case '\\':
+			buf = append(buf, '\\', '\\')
+		case '\n':
+			buf = append(buf, '\\', 'n')
+		case '\r':
+			buf = append(buf, '\\', 'r')
+		case '\t':
+			buf = append(buf, '\\', 't')
+		case 0x08:
+			buf = append(buf, '\\', 'b')
+		case 0x0c:
+			buf = append(buf, '\\', 'f')
+		default:
+			buf = append(buf, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+		}
+		start = i + 1
+	}
+	buf = append(buf, s[start:]...)
+	return append(buf, '"')
 }
 
 func appendStr(buf []byte, s string) []byte {
@@ -308,35 +887,24 @@ func appendStr(buf []byte, s string) []byte {
 	return append(buf, s...)
 }
 
+// schemaFieldNameNeedsQuoting: a bare name is `1*(ALPHA / DIGIT / "_")`;
+// all-digit names and the keywords are quoted too.
 func schemaFieldNameNeedsQuoting(s string) bool {
-	if len(s) == 0 {
+	if s == "" {
 		return true
 	}
-	if s == "true" || s == "false" {
-		return true
-	}
-	if s[0] == ' ' || s[len(s)-1] == ' ' {
-		return true
-	}
-	couldBeNumber := true
-	numStart := 0
-	if s[0] == '-' {
-		numStart = 1
-	}
-	if numStart >= len(s) {
-		couldBeNumber = false
-	}
+	allDigits := true
 	for i := 0; i < len(s); i++ {
-		b := s[i]
-		switch b {
-		case ' ', '\t', '\n', '\r', ',', '@', ':', '{', '}', '[', ']', '(', ')', '"', '\\':
+		c := s[i]
+		isDigit := c >= '0' && c <= '9'
+		if !(isDigit || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_') {
 			return true
 		}
-		if couldBeNumber && i >= numStart && !((b >= '0' && b <= '9') || b == '.') {
-			couldBeNumber = false
+		if !isDigit {
+			allDigits = false
 		}
 	}
-	return couldBeNumber && len(s) > numStart
+	return allDigits || s == "true" || s == "false" || s == "null"
 }
 
 func appendSchemaFieldName(buf []byte, s string) []byte {
@@ -344,527 +912,4 @@ func appendSchemaFieldName(buf []byte, s string) []byte {
 		return appendEscaped(buf, s)
 	}
 	return append(buf, s...)
-}
-
-// ---------------------------------------------------------------------------
-// Struct info cache
-// ---------------------------------------------------------------------------
-
-type fieldInfo struct {
-	name      string
-	index     []int
-	direct    int
-	tagged    bool
-	fieldType reflect.Type // resolved field type (for schema generation)
-}
-
-type structInfo struct {
-	fields             []fieldInfo
-	structType         reflect.Type   // the struct type these fields belong to
-	nameIndex          map[string]int // field name → index in fields slice
-	identityFieldMap   []int
-	fieldMapCache      boundedCache // map[string][]int, bounded to avoid unbounded growth
-	headerOnce         sync.Once
-	headerUntyped      []byte
-	headerTyped        []byte
-	sliceHeaderUntyped []byte
-	sliceHeaderTyped   []byte
-}
-
-var structCache sync.Map // map[reflect.Type]*structInfo
-
-func getStructInfo(t reflect.Type) *structInfo {
-	if v, ok := structCache.Load(t); ok {
-		return v.(*structInfo)
-	}
-	si := buildStructInfo(t)
-	actual, _ := structCache.LoadOrStore(t, si)
-	return actual.(*structInfo)
-}
-
-func buildStructInfo(t reflect.Type) *structInfo {
-	n := t.NumField()
-	fields := make([]fieldInfo, 0, n)
-	for i := 0; i < n; i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-		direct := -1
-		if len(f.Index) == 1 {
-			direct = f.Index[0]
-		}
-		fi := fieldInfo{index: f.Index, direct: direct, fieldType: f.Type}
-
-		// Check asun tag first, then json tag
-		if tag, ok := f.Tag.Lookup("asun"); ok {
-			if tag == "-" {
-				continue
-			}
-			name := tag
-			if idx := indexOf(name, ','); idx >= 0 {
-				name = name[:idx]
-			}
-			if name != "" {
-				fi.name = name
-				fi.tagged = true
-			}
-		}
-		if fi.name == "" {
-			if tag, ok := f.Tag.Lookup("json"); ok {
-				if tag == "-" {
-					continue
-				}
-				name := tag
-				if idx := indexOf(name, ','); idx >= 0 {
-					name = name[:idx]
-				}
-				if name != "" {
-					fi.name = name
-					fi.tagged = true
-				}
-			}
-		}
-		if fi.name == "" {
-			fi.name = f.Name
-		}
-
-		// Handle embedded structs
-		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			embedded := getStructInfo(f.Type)
-			for _, ef := range embedded.fields {
-				ef2 := ef
-				ef2.index = append(append([]int{}, f.Index...), ef.index...)
-				ef2.direct = -1
-				fields = append(fields, ef2)
-			}
-			continue
-		}
-
-		fields = append(fields, fi)
-	}
-	si := &structInfo{fields: fields, structType: t}
-	si.nameIndex = make(map[string]int, len(fields))
-	si.identityFieldMap = make([]int, len(fields))
-	for i, fi := range fields {
-		si.nameIndex[fi.name] = i
-		si.identityFieldMap[i] = i
-	}
-	return si
-}
-
-func indexOf(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
-
-// ---------------------------------------------------------------------------
-// Recursive schema generation
-// ---------------------------------------------------------------------------
-
-// appendStructSchema writes {field1,field2,...} for a struct type.
-// Nested structs and arrays always keep their @-scaffold in the field schema.
-func appendStructSchema(buf []byte, si *structInfo, typed bool) []byte {
-	buf = append(buf, '{')
-	for i, fi := range si.fields {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		buf = appendFieldSchema(buf, fi, typed)
-	}
-	buf = append(buf, '}')
-	return buf
-}
-
-func (si *structInfo) initHeaders() {
-	si.headerOnce.Do(func() {
-		si.headerUntyped = appendStructSchema(make([]byte, 0, 64), si, false)
-		si.headerUntyped = append(si.headerUntyped, ':')
-
-		si.headerTyped = appendStructSchema(make([]byte, 0, 96), si, true)
-		si.headerTyped = append(si.headerTyped, ':')
-
-		si.sliceHeaderUntyped = make([]byte, 0, len(si.headerUntyped)+2)
-		si.sliceHeaderUntyped = append(si.sliceHeaderUntyped, '[')
-		si.sliceHeaderUntyped = append(si.sliceHeaderUntyped, si.headerUntyped[:len(si.headerUntyped)-1]...)
-		si.sliceHeaderUntyped = append(si.sliceHeaderUntyped, ']', ':')
-
-		si.sliceHeaderTyped = make([]byte, 0, len(si.headerTyped)+2)
-		si.sliceHeaderTyped = append(si.sliceHeaderTyped, '[')
-		si.sliceHeaderTyped = append(si.sliceHeaderTyped, si.headerTyped[:len(si.headerTyped)-1]...)
-		si.sliceHeaderTyped = append(si.sliceHeaderTyped, ']', ':')
-	})
-}
-
-func (si *structInfo) structHeader(typed bool) []byte {
-	si.initHeaders()
-	if typed {
-		return si.headerTyped
-	}
-	return si.headerUntyped
-}
-
-func (si *structInfo) sliceHeader(typed bool) []byte {
-	si.initHeaders()
-	if typed {
-		return si.sliceHeaderTyped
-	}
-	return si.sliceHeaderUntyped
-}
-
-// appendFieldSchema writes a field's name and optional schema/type annotation.
-// Struct and slice-of-struct fields always get nested schema (structural info).
-// Primitive fields only get type annotations in typed mode.
-func appendFieldSchema(buf []byte, fi fieldInfo, typed bool) []byte {
-	buf = appendSchemaFieldName(buf, fi.name)
-	buf, _ = appendTypeSchema(buf, fi.fieldType, typed, true)
-	return buf
-}
-
-func appendArraySchema(buf []byte, t reflect.Type, typed bool) ([]byte, bool) {
-	buf = append(buf, '[')
-	elemType := t.Elem()
-	for elemType.Kind() == reflect.Ptr {
-		elemType = elemType.Elem()
-	}
-	switch elemType.Kind() {
-	case reflect.Struct:
-		buf = appendStructSchema(buf, getStructInfo(elemType), typed)
-	case reflect.Slice, reflect.Array:
-		var ok bool
-		buf, ok = appendArraySchema(buf, elemType, typed)
-		if !ok {
-			return buf[:len(buf)-1], false
-		}
-	default:
-		if typed {
-			hint := typeHintForKind(elemType.Kind())
-			if hint == "" {
-				return buf[:len(buf)-1], false
-			}
-			buf = append(buf, hint...)
-		}
-	}
-	buf = append(buf, ']')
-	return buf, true
-}
-
-func appendTypeSchema(buf []byte, t reflect.Type, typed bool, withMarker bool) ([]byte, bool) {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	switch t.Kind() {
-	case reflect.Struct:
-		if withMarker {
-			buf = append(buf, '@')
-		}
-		return appendStructSchema(buf, getStructInfo(t), typed), true
-	case reflect.Slice, reflect.Array:
-		if withMarker {
-			buf = append(buf, '@')
-		}
-		return appendArraySchema(buf, t, typed)
-	case reflect.Map:
-		return buf, false
-	default:
-		if !typed {
-			return buf, false
-		}
-		hint := typeHintForKind(t.Kind())
-		if hint == "" {
-			return buf, false
-		}
-		if withMarker {
-			buf = append(buf, '@')
-		}
-		buf = append(buf, hint...)
-		return buf, true
-	}
-}
-
-func typeHintForKind(k reflect.Kind) string {
-	switch k {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return "int"
-	case reflect.Float32, reflect.Float64:
-		return "float"
-	case reflect.Bool:
-		return "bool"
-	case reflect.String:
-		return "str"
-	default:
-		return ""
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-// Encode serializes a struct or slice of structs to ASUN format.
-// Single struct output: {field1,field2,...}:(val1,val2,...)
-// Slice output: [{field1,field2,...}]:(val1,val2,...),(val3,val4,...)
-func Encode(v any) ([]byte, error) {
-	return encodeInner(v, false)
-}
-
-// EncodeTyped serializes a struct or slice of structs to ASUN format with
-// `@` type annotations and structural markers.
-// Single: {field1@type1,field2@type2,...}:(val1,val2,...)
-// Slice: [{field1@type1,...}]:(val1,val2,...),(val3,val4,...)
-func EncodeTyped(v any) ([]byte, error) {
-	return encodeInner(v, true)
-}
-
-func encodeInner(v any, typed bool) ([]byte, error) {
-	rv := reflect.ValueOf(v)
-	if rv.Kind() == reflect.Ptr {
-		rv = rv.Elem()
-	}
-	// Auto-detect slice of structs
-	if rv.Kind() == reflect.Slice {
-		elemType := rv.Type().Elem()
-		for elemType.Kind() == reflect.Ptr {
-			elemType = elemType.Elem()
-		}
-		if elemType.Kind() == reflect.Struct {
-			return encodeSliceInner(v, typed)
-		}
-	}
-	if rv.Kind() != reflect.Struct {
-		// Untyped fallback: scalar / plain slice / interface / map.
-		bp := getBuf()
-		buf := *bp
-		buf, err := appendUntyped(buf, rv)
-		if err != nil {
-			*bp = buf
-			putBuf(bp)
-			return nil, err
-		}
-		out := make([]byte, len(buf))
-		copy(out, buf)
-		*bp = buf
-		putBuf(bp)
-		return out, nil
-	}
-	if err := ensureNoMapType(rv.Type()); err != nil {
-		return nil, err
-	}
-
-	bp := getBuf()
-	buf := *bp
-
-	si := getStructInfo(rv.Type())
-	buf = append(buf, si.structHeader(typed)...)
-	var err error
-	buf, err = marshalStruct(buf, rv, si)
-	if err != nil {
-		*bp = buf
-		putBuf(bp)
-		return nil, err
-	}
-
-	result := make([]byte, len(buf))
-	copy(result, buf)
-	*bp = buf
-	putBuf(bp)
-	return result, nil
-}
-
-// encodeSliceInner serializes a slice of structs to ASUN format.
-// Output: [{field1,field2,...}]:(v1,v2,...),(v3,v4,...)
-func encodeSliceInner(v any, typed bool) ([]byte, error) {
-	rv := reflect.ValueOf(v)
-	if rv.Kind() == reflect.Ptr {
-		rv = rv.Elem()
-	}
-	if rv.Kind() != reflect.Slice {
-		return nil, &MarshalError{"Encode requires a slice of structs"}
-	}
-	elemType := rv.Type().Elem()
-	for elemType.Kind() == reflect.Ptr {
-		elemType = elemType.Elem()
-	}
-	if elemType.Kind() != reflect.Struct {
-		return nil, &MarshalError{"Encode requires a slice of structs"}
-	}
-	if err := ensureNoMapType(elemType); err != nil {
-		return nil, err
-	}
-
-	si := getStructInfo(elemType)
-
-	bp := getBuf()
-	buf := *bp
-
-	buf = append(buf, si.sliceHeader(typed)...)
-
-	// Data rows
-	for i := 0; i < rv.Len(); i++ {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		elem := rv.Index(i)
-		if elem.Kind() == reflect.Ptr {
-			elem = elem.Elem()
-		}
-		var err error
-		buf, err = marshalStruct(buf, elem, si)
-		if err != nil {
-			*bp = buf
-			putBuf(bp)
-			return nil, err
-		}
-	}
-
-	result := make([]byte, len(buf))
-	copy(result, buf)
-	*bp = buf
-	putBuf(bp)
-	return result, nil
-}
-
-// ---------------------------------------------------------------------------
-// Internal marshal functions
-// ---------------------------------------------------------------------------
-
-func marshalStruct(buf []byte, rv reflect.Value, si *structInfo) ([]byte, error) {
-	buf = append(buf, '(')
-	for i := range si.fields {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		fi := &si.fields[i]
-		// Fast path: top-level (non-embedded) field — direct index lookup.
-		// `FieldByIndex` allocates and walks even when the slice has length 1,
-		// dominating struct encoding when called per-row × per-field. The
-		// `direct` cache mirrors what `fieldByInfo` does on the decode side.
-		var fv reflect.Value
-		if fi.direct >= 0 {
-			fv = rv.Field(fi.direct)
-		} else {
-			fv = rv.FieldByIndex(fi.index)
-		}
-		var err error
-		buf, err = marshalNestedValue(buf, fv)
-		if err != nil {
-			return buf, err
-		}
-	}
-	buf = append(buf, ')')
-	return buf, nil
-}
-
-func marshalNestedValue(buf []byte, fv reflect.Value) ([]byte, error) {
-	for fv.Kind() == reflect.Ptr || fv.Kind() == reflect.Interface {
-		if fv.IsNil() {
-			return buf, nil
-		}
-		fv = fv.Elem()
-	}
-
-	switch fv.Kind() {
-	case reflect.Bool:
-		if fv.Bool() {
-			buf = append(buf, "true"...)
-		} else {
-			buf = append(buf, "false"...)
-		}
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		buf = appendI64(buf, fv.Int())
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		buf = appendU64(buf, fv.Uint())
-	case reflect.Float32, reflect.Float64:
-		buf = appendFloat64(buf, fv.Float())
-	case reflect.String:
-		buf = appendStr(buf, fv.String())
-	case reflect.Slice, reflect.Array:
-		var err error
-		buf, err = marshalSliceValue(buf, fv)
-		if err != nil {
-			return buf, err
-		}
-	case reflect.Map:
-		return buf, errMapFieldsUnsupported
-	case reflect.Struct:
-		si := getStructInfo(fv.Type())
-		var err error
-		buf, err = marshalStruct(buf, fv, si)
-		if err != nil {
-			return buf, err
-		}
-	}
-	return buf, nil
-}
-
-func marshalSliceValue(buf []byte, fv reflect.Value) ([]byte, error) {
-	buf = append(buf, '[')
-	for i := 0; i < fv.Len(); i++ {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		var err error
-		buf, err = marshalNestedValue(buf, fv.Index(i))
-		if err != nil {
-			return buf, err
-		}
-	}
-	buf = append(buf, ']')
-	return buf, nil
-}
-
-func validateNoMapType(t reflect.Type, seen map[reflect.Type]bool) error {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if seen[t] {
-		return nil
-	}
-	seen[t] = true
-	switch t.Kind() {
-	case reflect.Map:
-		return errMapFieldsUnsupported
-	case reflect.Struct:
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if !f.IsExported() {
-				continue
-			}
-			if err := validateNoMapType(f.Type, seen); err != nil {
-				return err
-			}
-		}
-	case reflect.Slice, reflect.Array:
-		return validateNoMapType(t.Elem(), seen)
-	}
-	return nil
-}
-
-func ensureNoMapType(t reflect.Type) error {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if cached, ok := noMapTypeCache.Load(t); ok {
-		if cached.(bool) {
-			return nil
-		}
-		return errMapFieldsUnsupported
-	}
-	err := validateNoMapType(t, make(map[reflect.Type]bool))
-	noMapTypeCache.Store(t, err == nil)
-	return err
-}
-
-// unsafeString converts a byte slice to string without copying.
-func unsafeString(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	return unsafe.String(&b[0], len(b))
 }

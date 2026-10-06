@@ -15,7 +15,7 @@ func TestFix_DeepNestingBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected depth-limit error for deeply nested input")
 	}
-	if !strings.Contains(err.Error(), "nesting depth") {
+	if !strings.Contains(err.Error(), "depth limit") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -42,7 +42,7 @@ func TestFix_SchemaCacheBounded(t *testing.T) {
 		_ = Decode(data, &s)
 	}
 	count := 0
-	schemaFieldsCache.m.Range(func(_, _ any) bool { count++; return true })
+	schemaCache.m.Range(func(_, _ any) bool { count++; return true })
 	if int64(count) > maxCachedSchemas {
 		t.Fatalf("cache exceeded cap: %d > %d", count, maxCachedSchemas)
 	}

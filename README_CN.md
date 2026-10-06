@@ -125,7 +125,7 @@ type Config struct {
 对应的带类型 ASUN 文本：
 
 ```text
-{name@str,env@[{key@str,value@str}]}:(api,[(RUST_LOG,debug),(PORT,8080)])
+{name@str,env@[{key@str,value@str}]}:(api,[(RUST_LOG,debug),(PORT,"8080")])
 ```
 
 ## 当前 API
@@ -137,6 +137,8 @@ type Config struct {
 | `EncodePretty` / `EncodePrettyTyped` | 生成更易读的文本 |
 | `EncodeBinary`                       | 编码为二进制     |
 | `DecodeBinary`                       | 从二进制解码     |
+| `DecodeBinaryExact`                  | 从二进制解码，拒绝多余的尾部字节 |
+| `PrettyFormat`                       | 把紧凑 ASUN 文本重新缩进 |
 
 ## 运行示例
 

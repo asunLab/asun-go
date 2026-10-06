@@ -195,7 +195,7 @@ func TestAtStringRoundtripAllApis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(untyped) != `{text}:("@Alice")` {
+	if string(untyped) != `{text}:(@Alice)` {
 		t.Fatalf("unexpected untyped encode: %s", untyped)
 	}
 	var out Note
@@ -210,7 +210,7 @@ func TestAtStringRoundtripAllApis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(typed) != `{text@str}:("@Alice")` {
+	if string(typed) != `{text@str}:(@Alice)` {
 		t.Fatalf("unexpected typed encode: %s", typed)
 	}
 	out = Note{}
@@ -258,14 +258,12 @@ func TestAtStringRoundtripAllApis(t *testing.T) {
 	}
 }
 
-func TestTrailingComma(t *testing.T) {
+// ASUN 1.5 forbids a trailing comma after the last row (as asun-rs does).
+func TestTrailingCommaRejected(t *testing.T) {
 	input := "[{id,name,active}]:(1,Alice,true),(2,Bob,false),"
 	var users []User
-	if err := Decode([]byte(input), &users); err != nil {
-		t.Fatal(err)
-	}
-	if len(users) != 2 {
-		t.Fatalf("expected 2, got %d", len(users))
+	if err := Decode([]byte(input), &users); err == nil {
+		t.Fatalf("expected an error for a trailing comma, got %+v", users)
 	}
 }
 
@@ -765,7 +763,8 @@ func TestEncodeTypedOptional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(out2) != "{id@int,label@str,score@float}:(2,,)" {
+	// The schema comes from the value: a nil pointer carries no hint.
+	if string(out2) != "{id@int,label,score}:(2,,)" {
 		t.Fatalf("got %q", out2)
 	}
 }
@@ -1233,9 +1232,9 @@ func TestEncodeTypedEmptyBoolSlice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(out)
-	// Empty bool slice should still have type annotation from reflection
-	if !contains(s, "flags@[bool]") {
-		t.Fatalf("expected flags@[bool] for empty slice, got %s", s)
+	// The schema comes from the value: an empty slice has no element hint.
+	if s != "{name@str,flags@[]}:(test,[])" {
+		t.Fatalf("expected flags@[] for empty slice, got %s", s)
 	}
 }
 
@@ -1266,7 +1265,7 @@ type QuotedSchemaFields struct {
 }
 
 func TestDecodeFieldNamesWithPlusMinus(t *testing.T) {
-	input := []byte("{lowPriorityEIR+CIR,a-b,name}:(42,hello,Alice)")
+	input := []byte(`{"lowPriorityEIR+CIR","a-b",name}:(42,hello,Alice)`)
 	var v PlusMinusFields
 	if err := Decode(input, &v); err != nil {
 		t.Fatal(err)
@@ -1282,14 +1281,19 @@ func TestDecodeFieldNamesWithPlusMinus(t *testing.T) {
 	}
 }
 
-func TestDecodeFieldNamesPlusMinusUntyped(t *testing.T) {
+// A bare field name is `[A-Za-z0-9_]+`; anything else must be quoted.
+func TestDecodeFieldNamesPlusMinusBareRejected(t *testing.T) {
 	input := []byte("{lowPriorityEIR+CIR,a-b,name}:(42,hello,Alice)")
 	var v PlusMinusFields
-	if err := Decode(input, &v); err != nil {
+	if err := Decode(input, &v); err == nil {
+		t.Fatalf("expected an error for bare names with +/-, got %+v", v)
+	}
+	out, err := Encode(PlusMinusFields{LowPriority: "42", AB: "hello", Name: "Alice"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if v.LowPriority != "42" {
-		t.Fatalf("LowPriority = %q, want 42", v.LowPriority)
+	if string(out) != `{"lowPriorityEIR+CIR","a-b",name}:("42",hello,Alice)` {
+		t.Fatalf("got %s", out)
 	}
 }
 
